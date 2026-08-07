@@ -179,6 +179,26 @@ fn cuda_version_from_build_system() -> (usize, usize) {
             return (major, minor);
         }
     }
+    // No exact match (e.g. CUDA 13.3 when this cudarc tops out at 13.2). The CUDA driver API
+    // is forward-compatible within a major version, so instead of panicking, fall back to the
+    // newest supported release that is <= the detected one. Lets a 13.3 toolkit build against
+    // the 13.2 bindings (needed to enable NCCL for tensor-parallel decode on this box).
+    let detected: (usize, usize) = {
+        let mut it = version_number.split('.');
+        let maj = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let min = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        (maj, min)
+    };
+    let mut best: Option<(usize, usize)> = None;
+    for &((major, minor), _) in SUPPORTED_CUDA_VERSIONS.iter() {
+        if (major, minor) <= detected && best.map_or(true, |b| (major, minor) > b) {
+            best = Some((major, minor));
+        }
+    }
+    if let Some((major, minor)) = best {
+        println!("cargo:warning=CUDA {version_number} not explicitly supported by cudarc; using {major}.{minor} bindings (forward-compatible).");
+        return (major, minor);
+    }
     panic!("Unsupported cuda toolkit version: `{version_number}`. Please raise a github issue.")
 }
 
