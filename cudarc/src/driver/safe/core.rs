@@ -8,7 +8,7 @@ use std::{
     marker::PhantomData,
     ops::{Bound, RangeBounds},
     string::String,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
     vec::Vec,
 };
@@ -33,6 +33,17 @@ pub struct CudaContext {
     pub(crate) cu_ctx: sys::CUcontext,
     pub(crate) ordinal: usize,
     pub(crate) has_async_alloc: bool,
+    /// Force sync allocation (cuMemAlloc) even when the async mempool
+    /// (cuMemAllocAsync) is available. Defaults to TRUE: the async pool's
+    /// stream-ordered allocation reuse causes a use-after-free that crashes
+    /// long decode (>~512 tokens) on gemma4 with CUDA_ERROR_ILLEGAL_ADDRESS
+    /// — a freed buffer's address is handed to a new allocation whose use is
+    /// then clobbered by the original stream-ordered free. Sync alloc gives
+    /// each allocation a distinct cuMemAlloc/cuMemFree with no pool reuse,
+    /// eliminating the race. Measured zero decode/prefill perf cost (the
+    /// per-token allocations are tiny relative to kernel time). Graph capture
+    /// also requires sync alloc, so this is consistent with that path.
+    pub force_sync_alloc: std::sync::atomic::AtomicBool,
     /// Whether this wraps a primary context (true) or a non-primary context (false).
     /// Primary contexts are released via `cuDevicePrimaryCtxRelease`, while non-primary
     /// contexts are destroyed via `cuCtxDestroy_v2`.
@@ -40,6 +51,32 @@ pub struct CudaContext {
     pub(crate) num_streams: AtomicUsize,
     pub(crate) event_tracking: AtomicBool,
     pub(crate) error_state: AtomicU32,
+    /// Deferred-free fence. When set, sync
+    /// allocator frees (cuMemFree on CudaSlice::drop) are collected into
+    /// `deferred_free_ptrs` instead of executed immediately. This keeps
+    /// CUDA-graph-capture-time scratch (QMatMul / cuBLAS workspace a caller
+    /// can't reach at the Tensor level) alive across graph replays —
+    /// without it, those captured kernels reference freed memory →
+    /// CUDA_ERROR_ILLEGAL_ADDRESS at graph.launch(). Flush after the graph
+    /// is invalidated. Bounded: only one capture's worth of scratch is held.
+    pub(crate) defer_frees: AtomicBool,
+    pub(crate) deferred_free_ptrs: std::sync::Mutex<Vec<sys::CUdeviceptr>>,
+    /// Capture arena. When `arena_mode` is set, device
+    /// allocations are bump-allocated from a single pre-reserved arena
+    /// (`arena_base`..`arena_base+arena_size`) instead of issuing
+    /// `cuMemAllocAsync`. This is what makes CUDA-graph capture replay-safe:
+    /// no `cuMemAllocAsync`/`cuMemFreeAsync` during capture → no MEM_ALLOC /
+    /// MEM_FREE nodes baked into the graph → captured kernels reference
+    /// stable arena addresses valid across every replay. Drops of
+    /// arena-backed pointers are no-ops (detected by VA range). The arena
+    /// is allocated via `begin_capture_arena()` before capture and released
+    /// via `free_capture_arena()` after the graph is invalidated.
+    pub(crate) arena_mode: AtomicBool,
+    pub(crate) arena_base: AtomicU64,
+    pub(crate) arena_size: AtomicUsize,
+    pub(crate) arena_offset: AtomicUsize,
+    pub(crate) arena_peak: AtomicUsize,
+    pub(crate) arena_overflow: AtomicUsize,
 }
 
 unsafe impl Send for CudaContext {}
@@ -87,10 +124,19 @@ impl CudaContext {
             cu_ctx,
             ordinal,
             has_async_alloc,
+            force_sync_alloc: std::sync::atomic::AtomicBool::new(true),
             is_primary: true,
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            defer_frees: AtomicBool::new(false),
+            deferred_free_ptrs: std::sync::Mutex::new(Vec::new()),
+            arena_mode: AtomicBool::new(false),
+            arena_base: AtomicU64::new(0),
+            arena_size: AtomicUsize::new(0),
+            arena_offset: AtomicUsize::new(0),
+            arena_peak: AtomicUsize::new(0),
+            arena_overflow: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -159,10 +205,19 @@ impl CudaContext {
             cu_ctx,
             ordinal,
             has_async_alloc,
+            force_sync_alloc: std::sync::atomic::AtomicBool::new(true),
             is_primary: false,
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            defer_frees: AtomicBool::new(false),
+            deferred_free_ptrs: std::sync::Mutex::new(Vec::new()),
+            arena_mode: AtomicBool::new(false),
+            arena_base: AtomicU64::new(0),
+            arena_size: AtomicUsize::new(0),
+            arena_offset: AtomicUsize::new(0),
+            arena_peak: AtomicUsize::new(0),
+            arena_overflow: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -210,10 +265,19 @@ impl CudaContext {
             cu_ctx,
             ordinal,
             has_async_alloc,
+            force_sync_alloc: std::sync::atomic::AtomicBool::new(true),
             is_primary: false,
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            defer_frees: AtomicBool::new(false),
+            deferred_free_ptrs: std::sync::Mutex::new(Vec::new()),
+            arena_mode: AtomicBool::new(false),
+            arena_base: AtomicU64::new(0),
+            arena_size: AtomicUsize::new(0),
+            arena_offset: AtomicUsize::new(0),
+            arena_peak: AtomicUsize::new(0),
+            arena_overflow: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -247,10 +311,19 @@ impl CudaContext {
             cu_ctx,
             ordinal,
             has_async_alloc,
+            force_sync_alloc: std::sync::atomic::AtomicBool::new(true),
             is_primary: false,
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            defer_frees: AtomicBool::new(false),
+            deferred_free_ptrs: std::sync::Mutex::new(Vec::new()),
+            arena_mode: AtomicBool::new(false),
+            arena_base: AtomicU64::new(0),
+            arena_size: AtomicUsize::new(0),
+            arena_offset: AtomicUsize::new(0),
+            arena_peak: AtomicUsize::new(0),
+            arena_overflow: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -272,7 +345,176 @@ impl CudaContext {
     /// Memory allocations performed through the default [CudaStream] will use `cuMemAllocAsync`
     /// over `cuMemAlloc` if this method returns `true`.
     pub fn has_async_alloc(&self) -> bool {
-        self.has_async_alloc
+        self.has_async_alloc && !self.force_sync_alloc.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Disable async allocation (switch from cuMemAllocAsync to cuMemAlloc).
+    /// Required for CUDA graph capture — cuMemAllocAsync creates stream-ordered
+    /// dependencies that prevent cuStreamBeginCapture.
+    pub fn disable_async_alloc(&self) {
+        self.force_sync_alloc.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Begin the deferred-free fence. While
+    /// active, sync-allocator frees (cuMemFree on CudaSlice::drop) are
+    /// collected instead of executed. Call right before `begin_capture` so
+    /// CUDA-graph capture-time scratch survives across replays. Only
+    /// affects the sync allocator path (graph capture always uses it).
+    pub fn begin_defer_frees(&self) {
+        self.defer_frees.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop collecting frees (new drops free normally again) WITHOUT
+    /// releasing the already-collected pointers. The retained scratch stays
+    /// alive so captured graphs can replay. Call right after `end_capture`.
+    pub fn end_defer_frees(&self) {
+        self.defer_frees.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Release all deferred-free pointers collected since `begin_defer_frees`.
+    /// Call after the captured graph is invalidated / no longer replayed.
+    /// Synchronizes the default stream first so no in-flight replay still
+    /// references the scratch. Returns the number of pointers freed.
+    pub fn flush_deferred_frees(self: &Arc<Self>) -> usize {
+        self.record_err(self.bind_to_thread());
+        let ptrs: Vec<sys::CUdeviceptr> = match self.deferred_free_ptrs.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(_) => return 0,
+        };
+        if ptrs.is_empty() {
+            return 0;
+        }
+        // Ensure no replay is mid-flight before freeing the scratch.
+        let stream = self.default_stream();
+        self.record_err(stream.synchronize());
+        let n = ptrs.len();
+        // Pool (async) allocations must be freed via cuMemFreeAsync; raw
+        // (sync) allocations via cuMemFree. Mirror the alloc-time decision.
+        let use_async = self.has_async_alloc();
+        for p in ptrs {
+            if use_async {
+                self.record_err(unsafe { result::free_async(p, stream.cu_stream) });
+            } else {
+                self.record_err(unsafe { result::free_sync(p) });
+            }
+        }
+        if use_async {
+            self.record_err(stream.synchronize());
+        }
+        n
+    }
+
+    /// Number of pointers currently held by the deferred-free fence.
+    pub fn deferred_free_count(&self) -> usize {
+        self.deferred_free_ptrs.lock().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Capture arena: bump-allocate `nbytes` (256-byte
+    /// aligned) from the arena. Returns None on overflow (caller falls back
+    /// to a real allocation). Internal — called from CudaStream::alloc.
+    pub(crate) fn arena_bump(&self, nbytes: usize) -> Option<sys::CUdeviceptr> {
+        let aligned = (nbytes + 255) & !255;
+        let base = self.arena_base.load(Ordering::Relaxed);
+        let size = self.arena_size.load(Ordering::Relaxed);
+        if base == 0 || size == 0 {
+            return None;
+        }
+        // Reserve a slot via fetch_add (thread-safe bump).
+        let offset = self.arena_offset.fetch_add(aligned, Ordering::Relaxed);
+        if offset + aligned > size {
+            // Overflow: undo the bump bookkeeping isn't necessary (offset
+            // only grows; further allocs also overflow and fall back).
+            self.arena_overflow.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // Track peak for right-sizing.
+        let new_peak = offset + aligned;
+        let mut cur = self.arena_peak.load(Ordering::Relaxed);
+        while new_peak > cur {
+            match self.arena_peak.compare_exchange_weak(
+                cur, new_peak, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+        Some(base + offset as sys::CUdeviceptr)
+    }
+
+    /// True if `ptr` falls inside the live capture arena VA range. Used by
+    /// CudaSlice::drop to skip freeing arena-backed pointers.
+    pub(crate) fn ptr_in_arena(&self, ptr: sys::CUdeviceptr) -> bool {
+        let base = self.arena_base.load(Ordering::Relaxed);
+        let size = self.arena_size.load(Ordering::Relaxed);
+        base != 0 && ptr >= base && ptr < base + size as sys::CUdeviceptr
+    }
+
+    /// Allocate a capture arena of `size_bytes` (plain
+    /// sync cuMemAlloc → stable VA not tied to the async pool) and arm arena
+    /// mode. Call BEFORE begin_capture. All allocations during the captured
+    /// forward then bump-allocate from this arena (no MEM_ALLOC graph nodes).
+    pub fn begin_capture_arena(self: &Arc<Self>, size_bytes: usize) -> Result<(), DriverError> {
+        self.record_err(self.bind_to_thread());
+        // Free any previous arena first.
+        self.free_capture_arena();
+        let ptr = unsafe { result::malloc_sync(size_bytes) }?;
+        // Zero the arena once so any op that reads alloc'd-but-not-fully-
+        // written memory (e.g. padded buffers) sees zeros, matching the
+        // behavior of a freshly-zeroed pool allocation. (Diagnostic for the
+        // arena-forward garbage — uninitialized-read hypothesis.)
+        let stream = self.default_stream();
+        self.record_err(stream.synchronize());
+        self.record_err(unsafe {
+            result::memset_d8_sync(ptr, 0, size_bytes)
+        });
+        self.record_err(stream.synchronize());
+        self.arena_base.store(ptr, Ordering::Relaxed);
+        self.arena_size.store(size_bytes, Ordering::Relaxed);
+        self.arena_offset.store(0, Ordering::Relaxed);
+        self.arena_peak.store(0, Ordering::Relaxed);
+        self.arena_overflow.store(0, Ordering::Relaxed);
+        self.arena_mode.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Stop bump-allocating (subsequent allocs use the normal allocator)
+    /// WITHOUT freeing the arena — captured kernels still reference it.
+    /// Call right after end_capture. Returns (peak_bytes, overflow_count).
+    pub fn end_capture_arena(&self) -> (usize, usize) {
+        self.arena_mode.store(false, Ordering::Relaxed);
+        (
+            self.arena_peak.load(Ordering::Relaxed),
+            self.arena_overflow.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Re-arm bump-allocation on an ALREADY-ALLOCATED arena WITHOUT freeing it
+    /// or resetting the bump offset. Lets multiple captured graphs share one
+    /// persistent arena, each occupying a distinct offset range that stays valid
+    /// across all their replays (begin_capture_arena would free the prior arena →
+    /// stale pointers in earlier graphs). No-op if no arena is allocated.
+    pub fn resume_capture_arena(&self) -> bool {
+        if self.arena_base.load(Ordering::Relaxed) == 0 { return false; }
+        self.arena_mode.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Release the capture arena (cuMemFree). Call after the captured graph
+    /// is invalidated / no longer replayed. Synchronizes first.
+    pub fn free_capture_arena(self: &Arc<Self>) {
+        let base = self.arena_base.swap(0, Ordering::Relaxed);
+        self.arena_mode.store(false, Ordering::Relaxed);
+        self.arena_size.store(0, Ordering::Relaxed);
+        self.arena_offset.store(0, Ordering::Relaxed);
+        if base != 0 {
+            self.record_err(self.default_stream().synchronize());
+            self.record_err(unsafe { result::free_sync(base) });
+        }
+    }
+
+    /// Whether the capture arena is currently armed (bump-allocating).
+    pub fn arena_armed(&self) -> bool {
+        self.arena_mode.load(Ordering::Relaxed)
     }
 
     /// The number of devices available.
@@ -347,8 +589,10 @@ impl CudaContext {
     }
 
     /// Binds this context to the calling thread. Calling this is key for thread safety.
+    /// Multi-GPU: discard any stale error state from prior cross-context operations
+    /// (e.g. tensor drops on a different thread) so binding can always succeed.
     pub fn bind_to_thread(&self) -> Result<(), DriverError> {
-        self.check_err()?;
+        let _ = self.check_err(); // discard stale error state for multi-GPU robustness
         if match result::ctx::get_current()? {
             Some(curr_ctx) => curr_ctx != self.cu_ctx,
             None => true,
@@ -800,12 +1044,36 @@ unsafe impl<T> Sync for CudaSlice<T> {}
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
         let ctx = &self.stream.ctx;
+        // Multi-GPU: ensure this slice's context is bound before any operation.
+        // Without this, dropping a slice while another GPU's context is bound
+        // poisons the error state and breaks subsequent operations.
+        ctx.record_err(ctx.bind_to_thread());
         if ctx.is_managing_stream_synchronization() {
             if let Some(read) = self.read.as_ref() {
                 ctx.record_err(self.stream.wait(read));
             }
             if let Some(write) = self.write.as_ref() {
                 ctx.record_err(self.stream.wait(write));
+            }
+        }
+        // Capture arena: arena-backed pointers are sub-slices of a single
+        // pre-reserved buffer - never individually freed. The whole arena is
+        // released via free_capture_arena().
+        if ctx.ptr_in_arena(self.cu_device_ptr) {
+            return;
+        }
+        // Deferred-free fence. When active, collect the pointer instead of
+        // freeing now - for BOTH the async path (cuMemFreeAsync, which would
+        // otherwise be captured as a free-node in the CUDA graph) and the sync
+        // one. This keeps capture-time scratch valid across graph replays.
+        // Flushed via flush_deferred_frees().
+        if ctx.defer_frees.load(std::sync::atomic::Ordering::Relaxed) {
+            match ctx.deferred_free_ptrs.lock() {
+                Ok(mut v) => {
+                    v.push(self.cu_device_ptr);
+                    return;
+                }
+                Err(_) => { /* poisoned: fall through to immediate free */ }
             }
         }
         if ctx.has_async_alloc {
@@ -1536,6 +1804,29 @@ impl CudaStream {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
+        // Capture arena: when armed, bump-allocate from
+        // the pre-reserved arena instead of cuMemAllocAsync. This avoids
+        // creating MEM_ALLOC graph nodes during CUDA-graph capture, so the
+        // captured kernels reference stable arena VAs valid across replays.
+        if self.ctx.arena_mode.load(Ordering::Relaxed) {
+            if let Some(ptr) = self.ctx.arena_bump(len * std::mem::size_of::<T>()) {
+                let (read, write) = if self.ctx.is_event_tracking() {
+                    (Some(self.ctx.new_event(None)?), Some(self.ctx.new_event(None)?))
+                } else {
+                    (None, None)
+                };
+                return Ok(CudaSlice {
+                    cu_device_ptr: ptr,
+                    len,
+                    read,
+                    write,
+                    stream: self.clone(),
+                    marker: PhantomData,
+                });
+            }
+            // Arena overflow → fall through to a real alloc (creates a graph
+            // node; arena_overflow counter flags the arena is undersized).
+        }
         let cu_device_ptr = if self.ctx.has_async_alloc {
             result::malloc_async(self.cu_stream, len * std::mem::size_of::<T>())?
         } else {
